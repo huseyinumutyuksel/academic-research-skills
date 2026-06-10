@@ -13,6 +13,7 @@ from pathlib import Path
 
 import jsonschema
 import pytest
+import yaml
 
 from verify_submission_package import run
 
@@ -58,23 +59,46 @@ def checks_by_id(report):
 
 # --- Round 1: clean package, joined marker path -----------------------------
 
-def test_clean_package_all_pass_exit_0(tmp_path):
+def test_clean_package_family_c_passes(tmp_path):
+    # Without a venue profile the Family B checks are NOT-CHECKED (§3.2), so
+    # the honest exit code is 3 ("passed what was checkable", §8) — Family C
+    # itself is fully green.
     rc, report, _ = run_on("clean", tmp_path)
-    assert rc == 0
+    assert rc == 3
     by_id = checks_by_id(report)
     assert by_id["C1"]["status"] == "pass"
     assert by_id["C2"]["status"] == "pass"
-    assert report["header"]["not_checked_count"] == 0
 
 
 def test_clean_package_is_deterministic_joined_marker(tmp_path):
     _, report, _ = run_on("clean", tmp_path)
     assert report["header"]["extraction_path"] == "joined_marker"
-    for c in report["checks"]:
-        assert c["family"] == "reference_integrity"
-        assert c["signal_class"] == "deterministic"
+    by_id = checks_by_id(report)
+    for cid in ("C1", "C2"):
+        assert by_id[cid]["family"] == "reference_integrity"
+        assert by_id[cid]["signal_class"] == "deterministic"
     # strict_eligible is class-level: C1 promotable, C2 (warn-only) never —
     # asserted in test_C2_is_never_strict_eligible.
+
+
+# --- Slice 2: Family B venue limits ------------------------------------------
+
+def test_no_venue_profile_family_b_not_checked(tmp_path):
+    # §3.2: without a venue profile every Family B check is
+    # NOT-CHECKED(no venue profile) — never guessed from the journal name
+    # (R-L3-2-D mirror). The checks stay visible (deterministic,
+    # strict-eligible) so the slice-4 fail-closed path has something to see.
+    rc, report, _ = run_on("clean", tmp_path)
+    assert rc == 3
+    by_id = checks_by_id(report)
+    for cid in ("B1", "B2", "B3", "B4", "B5"):
+        assert by_id[cid]["status"] == "not_checked"
+        assert "no venue profile" in by_id[cid]["detail"]
+        assert by_id[cid]["family"] == "venue_limits"
+        assert by_id[cid]["signal_class"] == "deterministic"
+        assert by_id[cid]["strict_eligible"] is True
+    assert report["header"]["not_checked_count"] == 5
+    jsonschema.validate(report, load_schema())
 
 
 def test_clean_report_validates_against_schema(tmp_path):
@@ -94,6 +118,240 @@ def test_report_written_into_package_dir(tmp_path):
     assert (package_dir / REPORT_BASENAME).is_file()
 
 
+def test_full_profile_all_family_b_pass(tmp_path):
+    # venue_clean satisfies every limit in profiles/full.yaml; with both
+    # families green the exit code is a true 0.
+    profile = FIXTURES / "profiles" / "full.yaml"
+    rc, report, _ = run_on("venue_clean", tmp_path,
+                           extra_args=["--venue-profile", str(profile)])
+    assert rc == 0
+    by_id = checks_by_id(report)
+    for cid in ("B1", "B2", "B3", "B4", "B5", "C1", "C2"):
+        assert by_id[cid]["status"] == "pass", (cid, by_id[cid]["detail"])
+    # §3.2: the word-count method is declared in the report, never implied
+    # venue-exact.
+    assert "whitespace-split" in by_id["B1"]["detail"]
+    assert "body_only" in by_id["B1"]["detail"]
+    assert report["header"]["not_checked_count"] == 0
+    jsonschema.validate(report, load_schema())
+
+
+def test_violated_profile_every_family_b_check_fails(tmp_path):
+    # Mutation discipline (§8): every Family B check has a fixture that fails
+    # it. venue_violations breaks all five limits in profiles/tight.yaml.
+    profile = FIXTURES / "profiles" / "tight.yaml"
+    rc, report, _ = run_on("venue_violations", tmp_path,
+                           extra_args=["--venue-profile", str(profile)])
+    assert rc == 1
+    by_id = checks_by_id(report)
+    for cid in ("B1", "B2", "B3", "B4", "B5"):
+        assert by_id[cid]["status"] == "fail", (cid, by_id[cid]["detail"])
+        assert by_id[cid]["signal_class"] == "deterministic"
+        assert by_id[cid]["strict_eligible"] is True
+    assert "Data Availability" in by_id["B4"]["detail"]
+    # Family C stays green — the violations are venue limits, not integrity.
+    assert by_id["C1"]["status"] == "pass"
+    jsonschema.validate(report, load_schema())
+
+
+def test_partial_profile_runs_what_it_can(tmp_path):
+    # §4: a partially-declared profile runs the checks it can and
+    # NOT-CHECKEDs the rest, each with the undeclared field named.
+    profile = tmp_path / "partial.yaml"
+    profile.write_text(
+        "word_limit: 200\ndeclared_by: scholar\n", encoding="utf-8")
+    rc, report, _ = run_on("venue_clean", tmp_path,
+                           extra_args=["--venue-profile", str(profile)])
+    assert rc == 3
+    by_id = checks_by_id(report)
+    assert by_id["B1"]["status"] == "pass"
+    for cid, field in (("B2", "abstract_word_limit"),
+                       ("B3", "keyword_range"),
+                       ("B4", "required_sections"),
+                       ("B5", "reference_limit")):
+        assert by_id[cid]["status"] == "not_checked"
+        assert f"{field} not declared" in by_id[cid]["detail"]
+
+
+def test_word_count_tolerance_two_percent(tmp_path):
+    # §3.2: ±2% tolerance before fail (format-conversion noise). 101 words
+    # against a 100 limit passes; 103 fails.
+    profile = tmp_path / "profile.yaml"
+    profile.write_text(
+        "word_limit: 100\ndeclared_by: scholar\n", encoding="utf-8")
+    for n_words, expected in ((101, "pass"), (103, "fail")):
+        package = tmp_path / f"pkg{n_words}"
+        package.mkdir()
+        (package / "paper.md").write_text(
+            " ".join(["word"] * n_words) + "\n", encoding="utf-8")
+        run([str(package), "--venue-profile", str(profile)])
+        report = json.loads(
+            (package / REPORT_BASENAME).read_text(encoding="utf-8"))
+        assert checks_by_id(report)["B1"]["status"] == expected, n_words
+
+
+def test_invalid_venue_profile_is_usage_error(tmp_path):
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "paper.md").write_text("# x\n", encoding="utf-8")
+    cases = (
+        "word_limit: 100\n",                                  # no declared_by
+        "declared_by: tool\n",                                # wrong provenance
+        "declared_by: scholar\nword_count_scope: detexed\n",  # bad enum
+        "declared_by: scholar\nkeyword_range: {min: 5, max: 2}\n",  # min>max
+        "declared_by: scholar\nword_limit: -3\n",             # bad int
+    )
+    for body in cases:
+        profile = tmp_path / "bad.yaml"
+        profile.write_text(body, encoding="utf-8")
+        assert run([str(package), "--venue-profile", str(profile)]) == 2, body
+
+
+def test_missing_abstract_and_keywords_not_checked(tmp_path):
+    # Declared limits whose actuals cannot be located are NOT-CHECKED with the
+    # reason — never folded into pass (§1.4), never guessed.
+    profile = tmp_path / "profile.yaml"
+    profile.write_text(
+        "abstract_word_limit: 50\nkeyword_range: {min: 1, max: 5}\n"
+        "declared_by: scholar\n", encoding="utf-8")
+    rc, report, _ = run_on("clean", tmp_path,
+                           extra_args=["--venue-profile", str(profile)])
+    by_id = checks_by_id(report)
+    assert by_id["B2"]["status"] == "not_checked"
+    assert "no abstract section" in by_id["B2"]["detail"]
+    assert by_id["B3"]["status"] == "not_checked"
+    assert "no keywords line" in by_id["B3"]["detail"]
+
+
+def test_latex_manuscript_word_count_declares_detex(tmp_path):
+    # §10 item 4 (adjudicated at slice 2): LaTeX counting = naive detex +
+    # whitespace-split, the method is declared in the report, never promised
+    # venue-exact.
+    profile = tmp_path / "profile.yaml"
+    profile.write_text(
+        "word_limit: 5\ndeclared_by: scholar\n", encoding="utf-8")
+    rc, report, _ = run_on("fallback_latex", tmp_path,
+                           extra_args=["--venue-profile", str(profile)])
+    by_id = checks_by_id(report)
+    assert by_id["B1"]["status"] == "fail"
+    assert "naive detex" in by_id["B1"]["detail"]
+    assert by_id["B1"]["location"] == "paper.tex"
+
+
+def test_word_count_scope_all_counts_everything(tmp_path):
+    # codex P2: `all` must actually count everything (keywords line included);
+    # only body_only / body_plus_references exclude it. 10 body words +
+    # "**Keywords:** a, b" (3 tokens) against limit 10: body_only passes,
+    # all fails.
+    base = " ".join(["word"] * 10) + "\n\n**Keywords:** alpha, beta\n"
+    for scope, expected in (("body_only", "pass"), ("all", "fail")):
+        package = tmp_path / f"pkg_{scope}"
+        package.mkdir()
+        (package / "paper.md").write_text(base, encoding="utf-8")
+        profile = tmp_path / f"{scope}.yaml"
+        profile.write_text(
+            f"word_limit: 10\nword_count_scope: {scope}\n"
+            "declared_by: scholar\n", encoding="utf-8")
+        run([str(package), "--venue-profile", str(profile)])
+        report = json.loads(
+            (package / REPORT_BASENAME).read_text(encoding="utf-8"))
+        assert checks_by_id(report)["B1"]["status"] == expected, scope
+
+
+def test_profile_validation_matches_schema_strictness(tmp_path):
+    # codex P2: the CLI gate must not be looser than
+    # venue_profile.schema.json — unknown fields (additionalProperties false)
+    # and booleans-as-integers are rejected.
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "paper.md").write_text("# x\n", encoding="utf-8")
+    cases = (
+        "declared_by: scholar\nword_limt: 100\n",     # unknown field (typo)
+        "declared_by: scholar\nword_limit: true\n",   # bool is not an int
+        "declared_by: scholar\nvenue_name: 42\n",     # venue_name not a string
+        "declared_by: scholar\nkeyword_range: {min: -1, max: 2}\n",  # min < 0
+    )
+    for body in cases:
+        profile = tmp_path / "bad.yaml"
+        profile.write_text(body, encoding="utf-8")
+        assert run([str(package), "--venue-profile", str(profile)]) == 2, body
+
+
+def test_ambiguous_manuscript_not_checked(tmp_path):
+    # codex P2: with several non-canonical candidates the verifier must not
+    # silently pick the wordiest (it could be a response letter); it reports
+    # NOT-CHECKED(ambiguous manuscript). A canonical name (paper.* /
+    # manuscript.* / main.*) resolves the ambiguity.
+    profile = tmp_path / "profile.yaml"
+    profile.write_text(
+        "word_limit: 100\ndeclared_by: scholar\n", encoding="utf-8")
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "chapter_one.md").write_text("alpha " * 20, encoding="utf-8")
+    (package / "rejoinder.md").write_text("beta " * 30, encoding="utf-8")
+    run([str(package), "--venue-profile", str(profile)])
+    report = json.loads(
+        (package / REPORT_BASENAME).read_text(encoding="utf-8"))
+    b1 = checks_by_id(report)["B1"]
+    assert b1["status"] == "not_checked"
+    assert "ambiguous manuscript" in b1["detail"]
+
+    (package / "paper.md").write_text("gamma " * 10, encoding="utf-8")
+    run([str(package), "--venue-profile", str(profile)])
+    report = json.loads(
+        (package / REPORT_BASENAME).read_text(encoding="utf-8"))
+    b1 = checks_by_id(report)["B1"]
+    assert b1["status"] == "pass"
+    assert b1["location"] == "paper.md"
+
+
+def test_abstract_tolerance_and_b5_no_reference_list(tmp_path):
+    # codex P3: pin the B2 ±2% tolerance and the B5
+    # declared-limit-but-no-reference-list branch.
+    profile = tmp_path / "profile.yaml"
+    profile.write_text(
+        "abstract_word_limit: 100\nreference_limit: 5\n"
+        "declared_by: scholar\n", encoding="utf-8")
+    for n_words, expected in ((101, "pass"), (103, "fail")):
+        package = tmp_path / f"pkg{n_words}"
+        package.mkdir()
+        (package / "paper.md").write_text(
+            "## Abstract\n\n" + " ".join(["word"] * n_words) + "\n",
+            encoding="utf-8")
+        run([str(package), "--venue-profile", str(profile)])
+        report = json.loads(
+            (package / REPORT_BASENAME).read_text(encoding="utf-8"))
+        by_id = checks_by_id(report)
+        assert by_id["B2"]["status"] == expected, n_words
+        assert by_id["B5"]["status"] == "not_checked"
+        assert "no machine-readable reference list" in by_id["B5"]["detail"]
+
+
+def test_profile_with_no_manuscript_not_checked(tmp_path):
+    profile = tmp_path / "profile.yaml"
+    profile.write_text(
+        "word_limit: 100\ndeclared_by: scholar\n", encoding="utf-8")
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "figure.png").write_bytes(b"\x89PNG\r\n")
+    run([str(package), "--venue-profile", str(profile)])
+    report = json.loads(
+        (package / REPORT_BASENAME).read_text(encoding="utf-8"))
+    b1 = checks_by_id(report)["B1"]
+    assert b1["status"] == "not_checked"
+    assert "no manuscript found" in b1["detail"]
+
+
+def test_venue_profile_fixtures_validate_against_schema():
+    profile_schema = json.loads(
+        (REPO_ROOT / "shared" / "contracts" / "submission"
+         / "venue_profile.schema.json").read_text(encoding="utf-8"))
+    for name in ("full.yaml", "tight.yaml"):
+        profile = yaml.safe_load(
+            (FIXTURES / "profiles" / name).read_text(encoding="utf-8"))
+        jsonschema.validate(profile, profile_schema)
+
+
 # --- Round 2: fail / warn / NOT-CHECKED paths + exit codes -------------------
 
 def test_orphan_intext_citation_fails_C1_exit_1(tmp_path):
@@ -111,9 +369,9 @@ def test_orphan_intext_citation_fails_C1_exit_1(tmp_path):
 
 def test_uncited_reference_entry_warns_C2_exit_0(tmp_path):
     # §3.3: uncited reference entry = warn (some venues allow further-reading
-    # entries) — advisory, so the exit code stays 0.
+    # entries) — advisory, never a fail exit (3 = Family B not checked).
     rc, report, _ = run_on("uncited_reference", tmp_path)
-    assert rc == 0
+    assert rc == 3
     by_id = checks_by_id(report)
     assert by_id["C1"]["status"] == "pass"
     assert by_id["C2"]["status"] == "warn"
@@ -132,7 +390,7 @@ def test_markers_without_join_source_not_checked_exit_3(tmp_path):
     for cid in ("C1", "C2"):
         assert by_id[cid]["status"] == "not_checked"
         assert "missing prose-reference join" in by_id[cid]["detail"]
-    assert report["header"]["not_checked_count"] == 2
+    assert report["header"]["not_checked_count"] == 7  # 2 C + 5 B (no profile)
     assert report["header"]["extraction_path"] == "none"
     jsonschema.validate(report, load_schema())
 
@@ -146,7 +404,7 @@ def test_join_map_resolves_the_no_join_case(tmp_path):
     rc, report, _ = run_on(
         "marker_no_join", tmp_path,
         extra_args=["--passport", str(passport), "--join-map", str(join)])
-    assert rc == 0
+    assert rc == 3  # Family C green; B not checked (no profile)
     by_id = checks_by_id(report)
     assert by_id["C1"]["status"] == "pass"
     assert by_id["C2"]["status"] == "pass"
@@ -211,7 +469,7 @@ def test_summary_join_consumes_real_prose_join(tmp_path):
     passport = FIXTURES / "passports" / "summary_join.yaml"
     rc, report, _ = run_on("summary_join", tmp_path,
                            extra_args=["--passport", str(passport)])
-    assert rc == 0
+    assert rc == 3  # Family C green; B not checked (no profile)
     by_id = checks_by_id(report)
     assert by_id["C1"]["status"] == "pass"
     assert by_id["C2"]["status"] == "pass"
@@ -229,9 +487,10 @@ def test_no_machine_readable_reference_list_not_checked(tmp_path):
     report = json.loads(
         (package / REPORT_BASENAME).read_text(encoding="utf-8"))
     assert rc == 3
-    for c in report["checks"]:
-        assert c["status"] == "not_checked"
-        assert "no machine-readable reference list" in c["detail"]
+    by_id = checks_by_id(report)
+    for cid in ("C1", "C2"):
+        assert by_id[cid]["status"] == "not_checked"
+        assert "no machine-readable reference list" in by_id[cid]["detail"]
 
 
 def test_fingerprint_follows_audit_snapshot_convention_excluding_report(tmp_path):
@@ -328,7 +587,7 @@ def test_authoryear_fallback_tolerates_page_locators(tmp_path):
     report = json.loads(
         (package / REPORT_BASENAME).read_text(encoding="utf-8"))
     by_id = checks_by_id(report)
-    assert rc == 0
+    assert rc == 3  # Family C green; B not checked (no profile)
     assert by_id["C1"]["status"] == "pass"
     assert by_id["C2"]["status"] == "pass"
 
