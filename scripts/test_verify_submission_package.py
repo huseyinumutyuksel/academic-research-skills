@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import zipfile
 from pathlib import Path
 
 import jsonschema
@@ -340,6 +341,350 @@ def test_profile_with_no_manuscript_not_checked(tmp_path):
     b1 = checks_by_id(report)["B1"]
     assert b1["status"] == "not_checked"
     assert "no manuscript found" in b1["detail"]
+
+
+# --- Slice 3: Family A blind-review residue ----------------------------------
+
+def test_family_a_not_applicable_without_trigger(tmp_path):
+    # §3.1: the residue scan runs only when the package contains an anonymized
+    # variant or the profile declares double-blind. Untriggered checks are
+    # not_applicable — visibly distinct from not_checked (they did not need to
+    # run), so a single-blind package is not condemned to exit 3 forever.
+    rc, report, _ = run_on("clean", tmp_path)
+    by_id = checks_by_id(report)
+    for cid in ("A1", "A2", "A3", "A4", "A5", "A6", "A7"):
+        assert by_id[cid]["status"] == "not_applicable", cid
+        assert "not triggered" in by_id[cid]["detail"]
+        assert by_id[cid]["family"] == "blind_review_residue"
+    # not_applicable is not incompleteness: it does not count as not_checked.
+    assert report["header"]["not_checked_count"] == 5  # the B checks only
+    jsonschema.validate(report, load_schema())
+
+
+def test_declared_double_blind_without_variant_fails_A7(tmp_path):
+    # §3.1: a declared-double-blind package with NO anonymized variant is
+    # itself a fail — the most basic residue of all, the blind version is
+    # missing. A1-A6 have nothing to scan: not_checked.
+    profile = tmp_path / "double.yaml"
+    profile.write_text(
+        "blind_review: double\ndeclared_by: scholar\n", encoding="utf-8")
+    rc, report, _ = run_on("clean", tmp_path,
+                           extra_args=["--venue-profile", str(profile)])
+    assert rc == 1
+    by_id = checks_by_id(report)
+    assert by_id["A7"]["status"] == "fail"
+    assert "anonymized manuscript variant" in by_id["A7"]["detail"]
+    assert by_id["A7"]["strict_eligible"] is True
+    for cid in ("A1", "A2", "A3", "A4", "A5", "A6"):
+        assert by_id[cid]["status"] == "not_checked", cid
+        assert "no anonymized variant" in by_id[cid]["detail"]
+
+
+def test_anonymized_variant_triggers_family_a(tmp_path):
+    # Presence of an anonymized variant triggers the scan even without a
+    # profile (presence-or-declaration, §3.1). With an .md-only variant the
+    # PDF/DOCX metadata checks have no object: not_applicable.
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "paper.md").write_text(
+        "Body (Smith, 2024) <!--ref:smith2024-->.\n", encoding="utf-8")
+    shutil.copy(FIXTURES / "clean" / "references.bib",
+                package / "references.bib")
+    (package / "paper_anonymized.md").write_text(
+        "# T\n\nBody text without identity.\n", encoding="utf-8")
+    rc, report = run_dir(package)
+    by_id = checks_by_id(report)
+    assert by_id["A7"]["status"] == "pass"
+    for cid in ("A1", "A2", "A3"):
+        assert by_id[cid]["status"] == "not_applicable", cid
+        assert "no PDF" in by_id[cid]["detail"] or "no DOCX" in by_id[cid]["detail"]
+    jsonschema.validate(report, load_schema())
+
+
+_DOCX_CORE_TMPL = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+    '<cp:coreProperties '
+    'xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" '
+    'xmlns:dc="http://purl.org/dc/elements/1.1/">'
+    "<dc:creator>{creator}</dc:creator>"
+    "<cp:lastModifiedBy>{last_modified_by}</cp:lastModifiedBy>"
+    "</cp:coreProperties>")
+_DOCX_DOC_TMPL = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+    '<w:document '
+    'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+    "<w:body><w:p><w:r><w:t>Blind body text.</w:t></w:r></w:p>{extra}</w:body>"
+    "</w:document>")
+
+
+def make_docx(path, creator="", last_modified_by="", ins_author=None,
+              comment_author=None):
+    """Minimal raw-structure .docx (a zip with core.xml + document.xml [+
+    comments.xml]) — exactly the parts the residue scan reads (§1.3: the
+    deliverable is the raw file, not the rendered view)."""
+    extra = ""
+    if ins_author:
+        extra = (f'<w:ins w:id="1" w:author="{ins_author}">'
+                 "<w:r><w:t>inserted</w:t></w:r></w:ins>")
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr("docProps/core.xml", _DOCX_CORE_TMPL.format(
+            creator=creator, last_modified_by=last_modified_by))
+        z.writestr("word/document.xml", _DOCX_DOC_TMPL.format(extra=extra))
+        if comment_author:
+            z.writestr(
+                "word/comments.xml",
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<w:comments xmlns:w="http://schemas.openxmlformats.org/'
+                'wordprocessingml/2006/main">'
+                f'<w:comment w:id="0" w:author="{comment_author}">'
+                "<w:p><w:r><w:t>note</w:t></w:r></w:p></w:comment>"
+                "</w:comments>")
+
+
+def _blind_package(tmp_path, **docx_kwargs):
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "paper.md").write_text("Body.\n", encoding="utf-8")
+    make_docx(package / "paper_anonymized.docx", **docx_kwargs)
+    rc, report = run_dir(package)
+    return checks_by_id(report)
+
+
+def test_docx_metadata_author_residue_fails_A2(tmp_path):
+    # A2 (§3.1): docProps/core.xml creator / lastModifiedBy non-empty in the
+    # blind variant is a deterministic fact about the file — invisible to any
+    # rendered-view scan (§1.3).
+    by_id = _blind_package(tmp_path, creator="Jordan Smith")
+    assert by_id["A2"]["status"] == "fail"
+    assert "Jordan Smith" in by_id["A2"]["detail"]
+    assert by_id["A2"]["strict_eligible"] is True
+    assert by_id["A3"]["status"] == "pass"
+
+
+def test_docx_clean_metadata_passes_A2_A3(tmp_path):
+    by_id = _blind_package(tmp_path)
+    assert by_id["A2"]["status"] == "pass"
+    assert by_id["A3"]["status"] == "pass"
+
+
+def test_docx_tracked_change_author_fails_A3(tmp_path):
+    by_id = _blind_package(tmp_path, ins_author="J. Smith")
+    assert by_id["A3"]["status"] == "fail"
+    assert "J. Smith" in by_id["A3"]["detail"]
+
+
+def test_docx_comment_author_fails_A3(tmp_path):
+    by_id = _blind_package(tmp_path, comment_author="Reviewer Zero")
+    assert by_id["A3"]["status"] == "fail"
+    assert "Reviewer Zero" in by_id["A3"]["detail"]
+
+
+def test_corrupt_docx_not_checked(tmp_path):
+    # An unreadable artifact is incompleteness, never folded into pass (§1.4).
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "paper.md").write_text("Body.\n", encoding="utf-8")
+    (package / "paper_anonymized.docx").write_bytes(b"not a zip")
+    _rc, report = run_dir(package)
+    by_id = checks_by_id(report)
+    for cid in ("A2", "A3"):
+        assert by_id[cid]["status"] == "not_checked"
+        assert "unreadable" in by_id[cid]["detail"]
+
+
+def test_pdf_metadata_author_fails_A1(tmp_path):
+    pypdf = pytest.importorskip("pypdf")
+
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "paper.md").write_text("Body.\n", encoding="utf-8")
+    writer = pypdf.PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+    writer.add_metadata({"/Author": "Jordan Smith"})
+    with open(package / "paper_blind.pdf", "wb") as f:
+        writer.write(f)
+    _rc, report = run_dir(package)
+    a1 = checks_by_id(report)["A1"]
+    assert a1["status"] == "fail"
+    assert "Jordan Smith" in a1["detail"]
+    assert a1["strict_eligible"] is True
+
+
+def test_pdf_parser_unavailable_is_not_checked(tmp_path, monkeypatch):
+    # §1.4/#349: a missing parser must surface as NOT-CHECKED, never read as
+    # covered. (The slice-4 strict mode turns this into
+    # VERIFICATION-INCOMPLETE.)
+    import verify_submission_package as v
+
+    monkeypatch.setattr(v, "pypdf", None)
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "paper.md").write_text("Body.\n", encoding="utf-8")
+    (package / "paper_blind.pdf").write_bytes(b"%PDF-1.4\n%%EOF\n")
+    _rc, report = run_dir(package)
+    a1 = checks_by_id(report)["A1"]
+    assert a1["status"] == "not_checked"
+    assert "pypdf" in a1["detail"]
+
+
+def test_A4_strict_only_when_profile_forbids_acknowledgments(tmp_path):
+    # §3.1 load-bearing: A4's SIGNAL is deterministic but the judgment is the
+    # scholar's — strict-eligible ONLY when the venue profile explicitly
+    # declares acknowledgments must be removed from the blind version.
+    def build(profile_body):
+        package = tmp_path / f"pkg{len(profile_body)}"
+        package.mkdir()
+        (package / "paper.md").write_text("Body.\n", encoding="utf-8")
+        (package / "paper_anonymized.md").write_text(
+            "# Title\n\n## Acknowledgments\n\nWe thank our colleagues.\n",
+            encoding="utf-8")
+        profile = tmp_path / f"p{len(profile_body)}.yaml"
+        profile.write_text(profile_body, encoding="utf-8")
+        run([str(package), "--venue-profile", str(profile)])
+        return json.loads(
+            (package / REPORT_BASENAME).read_text(encoding="utf-8"))
+
+    base = "blind_review: double\ndeclared_by: scholar\n"
+    a4 = checks_by_id(build(base))["A4"]
+    assert a4["status"] == "fail"
+    assert a4["strict_eligible"] is False
+
+    a4 = checks_by_id(build(
+        base + "acknowledgments_forbidden_in_blind: true\n"))["A4"]
+    assert a4["status"] == "fail"
+    assert a4["strict_eligible"] is True
+
+
+def test_A6_filename_leakage_from_original_metadata(tmp_path):
+    # §3.1 A6: author-name tokens harvested from the NON-anonymized artifact's
+    # metadata, matched against package filenames (heuristic — coincidental
+    # tokens can false-positive). The metadata-source original itself is not
+    # scanned (its identified name is expected).
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "paper.md").write_text("Body.\n", encoding="utf-8")
+    make_docx(package / "paper.docx", creator="Jordan Smith")
+    make_docx(package / "paper_anonymized.docx")
+    (package / "smith_appendix.csv").write_text("x\n", encoding="utf-8")
+    _rc, report = run_dir(package)
+    a6 = checks_by_id(report)["A6"]
+    assert a6["status"] == "fail"
+    assert "smith_appendix.csv" in a6["detail"]
+    assert a6["signal_class"] == "heuristic"
+    assert a6["strict_eligible"] is False
+
+
+def test_A6_without_original_metadata_not_checked(tmp_path):
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "paper.md").write_text("Body.\n", encoding="utf-8")
+    (package / "paper_anonymized.md").write_text("Body.\n", encoding="utf-8")
+    _rc, report = run_dir(package)
+    a6 = checks_by_id(report)["A6"]
+    assert a6["status"] == "not_checked"
+    assert "no author" in a6["detail"]
+
+
+def test_A5_zh_tw_self_citation_phrase(tmp_path):
+    # §10 item 1: the phrasing list must not be anglophone-only.
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "paper.md").write_text("Body.\n", encoding="utf-8")
+    (package / "paper_anonymized.md").write_text(
+        "# 匿名稿\n\n如我們先前的研究所示，品保回饋迴圈存在斷點。\n",
+        encoding="utf-8")
+    _rc, report = run_dir(package)
+    a5 = checks_by_id(report)["A5"]
+    assert a5["status"] == "fail"
+    assert "我們先前的研究" in a5["detail"]
+
+
+# --- codex slice-3 review round ----------------------------------------------
+
+def test_A4_docx_only_variant_is_not_checked_not_applicable(tmp_path):
+    # codex P1: a DOCX-only blind variant means the acknowledgments scan
+    # SHOULD run but cannot (no text-form variant to read headings from) —
+    # that is not_checked honesty, never not_applicable masquerade.
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "paper.md").write_text("Body.\n", encoding="utf-8")
+    make_docx(package / "paper_anonymized.docx")
+    _rc, report = run_dir(package)
+    a4 = checks_by_id(report)["A4"]
+    assert a4["status"] == "not_checked"
+    assert "text-form" in a4["detail"]
+
+
+def test_A7_not_satisfied_by_blind_named_supplement(tmp_path):
+    # codex P1: a declared double-blind package whose only blind-named file is
+    # an ancillary CSV has NO blind manuscript variant — A7 must still fail.
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "paper.md").write_text("Body.\n", encoding="utf-8")
+    (package / "blind_survey.csv").write_text("q,a\n", encoding="utf-8")
+    profile = tmp_path / "double.yaml"
+    profile.write_text(
+        "blind_review: double\ndeclared_by: scholar\n", encoding="utf-8")
+    rc = run([str(package), "--venue-profile", str(profile)])
+    report = json.loads(
+        (package / REPORT_BASENAME).read_text(encoding="utf-8"))
+    assert rc == 1
+    assert checks_by_id(report)["A7"]["status"] == "fail"
+
+
+def test_untriggered_A4_is_never_strict_eligible(tmp_path):
+    # codex P1: A4's eligibility comes ONLY from the explicit profile
+    # declaration — including on the untriggered/not_applicable path.
+    _rc, report, _ = run_on("clean", tmp_path)
+    assert checks_by_id(report)["A4"]["strict_eligible"] is False
+
+
+def test_A6_token_match_does_not_flag_substrings(tmp_path):
+    # codex P2: token-to-token matching — `Smith` must not flag
+    # `blacksmith_notes.md`.
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "paper.md").write_text("Body.\n", encoding="utf-8")
+    make_docx(package / "paper.docx", creator="Jordan Smith")
+    make_docx(package / "paper_anonymized.docx")
+    (package / "blacksmith_notes.md").write_text("x\n", encoding="utf-8")
+    _rc, report = run_dir(package)
+    a6 = checks_by_id(report)["A6"]
+    assert a6["status"] == "pass", a6["detail"]
+
+
+def test_oversized_docx_part_is_not_checked(tmp_path, monkeypatch):
+    # codex P2: unbounded zip reads are a zip-bomb exposure; oversized parts
+    # are reported as unreadable incompleteness, never scanned or passed.
+    import verify_submission_package as v
+
+    monkeypatch.setattr(v, "_MAX_XML_PART_BYTES", 64)
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "paper.md").write_text("Body.\n", encoding="utf-8")
+    make_docx(package / "paper_anonymized.docx",
+              creator="x" * 200)  # inflates core.xml past the test cap
+    _rc, report = run_dir(package)
+    a2 = checks_by_id(report)["A2"]
+    assert a2["status"] == "not_checked"
+    assert "unreadable" in a2["detail"]
+
+
+def test_profile_rejects_nonboolean_acknowledgments_forbidden_field(tmp_path):
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "paper.md").write_text("# x\n", encoding="utf-8")
+    profile = tmp_path / "p.yaml"
+    profile.write_text(
+        "declared_by: scholar\nacknowledgments_forbidden_in_blind: maybe\n",
+        encoding="utf-8")
+    assert run([str(package), "--venue-profile", str(profile)]) == 2
+
+
+def test_schema_accepts_not_applicable():
+    # (Unknown statuses are rejected by test_schema_rejects_unknown_status.)
+    ok = _minimal_report(status="not_applicable")
+    jsonschema.validate(ok, load_schema())
 
 
 def test_venue_profile_fixtures_validate_against_schema():

@@ -47,6 +47,8 @@ import argparse
 import json
 import re
 import sys
+import xml.etree.ElementTree as ET
+import zipfile
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
@@ -56,6 +58,35 @@ try:
     from audit_snapshot import sha256_hex
 except ImportError:  # pragma: no cover - dual-path import
     from scripts.audit_snapshot import sha256_hex
+
+try:
+    import pypdf
+except ImportError:  # the A1 PDF scan reports NOT-CHECKED without it (§1.4)
+    pypdf = None
+
+try:
+    # Hardened XML parsing (XML-bomb/XXE protection) when available; the
+    # stdlib fallback does not fetch external entities but is exposed to
+    # entity-expansion DoS — acceptable only because the input is the
+    # scholar's own package, and requirements-dev installs the hardened path.
+    from defusedxml.ElementTree import fromstring as _xml_fromstring
+    from defusedxml.common import DefusedXmlException as _DefusedXmlException
+except ImportError:
+    _xml_fromstring = ET.fromstring
+
+    class _DefusedXmlException(Exception):
+        """Placeholder when defusedxml is absent — never raised."""
+
+
+# A hardened-parser rejection (entity/DOCTYPE tricks) is an unreadable
+# artifact, reported as NOT-CHECKED — it must not crash the scan.
+_XML_READ_ERRORS = (zipfile.BadZipFile, ET.ParseError, OSError, KeyError,
+                    ValueError, _DefusedXmlException)
+
+# Zip-bomb guards for the raw DOCX part reads (read-only scan, no extraction
+# — path traversal is not exposed, memory is).
+_MAX_XML_PART_BYTES = 50 * 1024 * 1024
+_MAX_ZIP_ENTRIES = 10_000
 
 REPORT_BASENAME = "submission_verification_report.json"
 
@@ -94,6 +125,13 @@ _LOCATION_CAP = 5  # findings listed per check detail before truncation
 # fail open. build_report enforces the roster: a runner that silently omits
 # a registered check cannot emit a report (the §1.4/#349 fail-open guard).
 _CHECK_REGISTRY = {
+    "A1": ("blind_review_residue", True, "deterministic"),  # PDF metadata authors
+    "A2": ("blind_review_residue", True, "deterministic"),  # DOCX metadata authors
+    "A3": ("blind_review_residue", True, "deterministic"),  # DOCX revision/comment authors
+    "A4": ("blind_review_residue", True, "deterministic"),  # acknowledgments in blind variant (strict only by profile declaration, §3.1)
+    "A5": ("blind_review_residue", True, "heuristic"),      # self-citation phrasing
+    "A6": ("blind_review_residue", True, "heuristic"),      # filename leakage
+    "A7": ("blind_review_residue", True, "deterministic"),  # blind variant missing under declared double-blind
     "B1": ("venue_limits", True, "deterministic"),   # manuscript word count
     "B2": ("venue_limits", True, "deterministic"),   # abstract word count
     "B3": ("venue_limits", True, "deterministic"),   # keyword count range
@@ -276,15 +314,22 @@ def _extract_fallback(manuscripts: dict[str, str],
 
 def _check(check_id: str, status: str, detail: str, *,
            signal_class: str = "deterministic",
-           location: Optional[str] = None) -> dict[str, Any]:
+           location: Optional[str] = None,
+           strict_eligible: Optional[bool] = None) -> dict[str, Any]:
     family, fail_capable, fixed_class = _CHECK_REGISTRY[check_id]
     if fixed_class is not None:
         signal_class = fixed_class  # registry-bound class wins (§3.1)
+    eligible = fail_capable and signal_class == "deterministic"
+    if strict_eligible is not None:
+        # Downward-only override: a call site can RESTRICT eligibility (A4 is
+        # advisory unless the venue profile declares acknowledgments must be
+        # removed, §3.1) but can never promote past the class rule above.
+        eligible = eligible and strict_eligible
     return {
         "id": check_id,
         "family": family,
         "signal_class": signal_class,
-        "strict_eligible": fail_capable and signal_class == "deterministic",
+        "strict_eligible": eligible,
         "status": status,
         "detail": detail,
         "location": location,
@@ -826,7 +871,409 @@ def _validate_venue_profile(raw: dict[str, Any]) -> dict[str, Any]:
             or not all(isinstance(s, str) and s for s in sections)):
         raise ValueError("venue profile required_sections must be a list of "
                          "non-empty strings or null")
+    ack = raw.get("acknowledgments_forbidden_in_blind")
+    if ack is not None and not isinstance(ack, bool):
+        raise ValueError(
+            f"venue profile acknowledgments_forbidden_in_blind must be a "
+            f"boolean or null, got {ack!r}")
     return raw
+
+
+# --- Family A: blind-review residue (§3.1) -----------------------------------
+
+_FAMILY_A_IDS = tuple(
+    cid for cid, (fam, _fc, _sc) in sorted(_CHECK_REGISTRY.items())
+    if fam == "blind_review_residue")
+_SCAN_A_IDS = ("A1", "A2", "A3", "A4", "A5", "A6")  # the variant-scanning subset
+
+# Filename convention for the anonymized (blind-review) variant: a stem token
+# match, so `paper_anonymized.docx` / `manuscript-blind.pdf` classify but
+# `canonical.md` does not.
+_BLIND_STEM_TOKENS = frozenset(
+    {"anonymized", "anonymised", "anonymous", "anon", "blind", "blinded"})
+# Only manuscript-class artifacts count as "the blind variant" — a
+# blind-named ancillary file (blind_survey.csv) is not a blind manuscript
+# and must not satisfy A7 under a declared double-blind venue.
+_VARIANT_SUFFIXES = (".md", ".tex", ".txt", ".docx", ".pdf")
+
+# A5 self-citation phrasing (§3.1 — heuristic by class). zh-TW list drafted
+# first-party per spec §10 item 1; curation pending maintainer review.
+_SELF_CITATION_PHRASES = (
+    "our previous work", "our earlier study", "our prior work",
+    "we previously showed", "we have previously", "in our previous",
+    "我們先前的研究", "我們過去的研究", "我們先前曾", "我們已於先前",
+    "筆者先前的研究", "本研究團隊先前",
+)
+
+_ACK_TITLE_RE = re.compile(r"acknowledg(?:e)?ments?|致謝", re.IGNORECASE)
+
+
+def _is_anonymized_name(rel: str) -> bool:
+    if not rel.lower().endswith(_VARIANT_SUFFIXES):
+        return False
+    tokens = re.split(r"[-_.\s]+", Path(rel).stem.lower())
+    return any(t in _BLIND_STEM_TOKENS for t in tokens)
+
+
+def _a4_strict(profile: Optional[dict[str, Any]]) -> bool:
+    """A4 is strict-eligible ONLY when the venue profile explicitly declares
+    acknowledgments must be removed from the blind version (§3.1 load-bearing
+    — the deterministic signal stays advisory otherwise because the
+    de-anonymization judgment is the scholar's). Single definition so EVERY
+    A4 emission path (pass/fail/not_checked/not_applicable) agrees."""
+    return bool(profile) and (
+        profile.get("acknowledgments_forbidden_in_blind") is True)
+
+
+def _package_files(package_dir: Path) -> list[str]:
+    return sorted(
+        p.relative_to(package_dir).as_posix()
+        for p in package_dir.rglob("*")
+        if p.is_file() and p.name not in _SCAN_EXCLUDED_NAMES)
+
+
+def _blanket_family_a(ids, status: str, reason: str,
+                      profile: Optional[dict[str, Any]]
+                      ) -> list[dict[str, Any]]:
+    """One emitter for every whole-family blanket path (untriggered
+    not_applicable / no-variant not_checked), so A4's profile-conditional
+    eligibility cannot diverge between them."""
+    return [_check(i, status, reason,
+                   strict_eligible=_a4_strict(profile) if i == "A4" else None)
+            for i in ids]
+
+
+def run_family_a(package_dir: Path, manuscripts: dict[str, str],
+                 profile: Optional[dict[str, Any]]
+                 ) -> list[dict[str, Any]]:
+    """Family A: blind-review residue scan (§3.1). Trigger is
+    presence-or-declaration: an anonymized variant in the package, or a
+    declared double-blind venue. Untriggered = not_applicable (the package
+    has no blind submission set to protect)."""
+    declared_double = bool(profile) and profile.get("blind_review") == "double"
+    all_rels = _package_files(package_dir)
+    anon_rels = [r for r in all_rels if _is_anonymized_name(r)]
+
+    if not anon_rels and not declared_double:
+        return _blanket_family_a(
+            _FAMILY_A_IDS, "not_applicable",
+            "not triggered: no anonymized variant in the package and no "
+            "declared double-blind review (§3.1 presence-or-declaration)",
+            profile)
+
+    checks: list[dict[str, Any]] = []
+    if declared_double and not anon_rels:
+        checks.append(_check(
+            "A7", "fail",
+            "venue profile declares double-blind review but the package "
+            "contains no anonymized manuscript variant "
+            f"({'/'.join(_VARIANT_SUFFIXES)} with a name token among "
+            f"{'/'.join(sorted(_BLIND_STEM_TOKENS))}) — the blind version "
+            "is missing (the most basic residue of all, §3.1)"))
+        checks.extend(_blanket_family_a(
+            _SCAN_A_IDS, "not_checked", "no anonymized variant to scan",
+            profile))
+        return checks
+
+    checks.append(_check(
+        "A7", "pass",
+        f"anonymized variant present: {', '.join(anon_rels)}"))
+    checks.extend(_scan_blind_set(
+        package_dir, manuscripts, all_rels, anon_rels, profile))
+    return checks
+
+
+def _scan_blind_set(package_dir: Path, manuscripts: dict[str, str],
+                    all_rels: list[str], anon_rels: list[str],
+                    profile: Optional[dict[str, Any]]
+                    ) -> list[dict[str, Any]]:
+    """A1-A6 over the blind submission set (the anonymized variants)."""
+    checks: list[dict[str, Any]] = []
+    pdf_rels = [r for r in anon_rels if r.lower().endswith(".pdf")]
+    docx_rels = [r for r in anon_rels if r.lower().endswith(".docx")]
+    text_rels = [r for r in anon_rels if r in manuscripts]
+
+    checks.extend(_pdf_metadata_checks(package_dir, pdf_rels))
+    checks.extend(_docx_residue_checks(package_dir, docx_rels))
+    checks.extend(_text_residue_checks(manuscripts, text_rels, profile))
+    checks.append(_filename_leakage_check(package_dir, all_rels, anon_rels))
+    return checks
+
+
+def _residue_verdict(check_id: str, findings: "list[tuple[str, str]]",
+                     unreadable: list[str], what: str) -> dict[str, Any]:
+    """fail on any (rel, message) finding; otherwise not_checked if any
+    artifact was unreadable (incompleteness is never folded into pass, §1.4);
+    else pass."""
+    if findings:
+        listed = "; ".join(f"{rel}: {msg}"
+                           for rel, msg in findings[:_LOCATION_CAP])
+        return _check(check_id, "fail",
+                      f"{what} in the blind submission set: {listed}",
+                      location=findings[0][0])
+    if unreadable:
+        return _check(check_id, "not_checked",
+                      f"unreadable artifact(s), {what} could not be scanned: "
+                      f"{', '.join(unreadable[:_LOCATION_CAP])}")
+    return _check(check_id, "pass", f"no {what} in the blind submission set")
+
+
+def _pdf_metadata_checks(package_dir: Path,
+                         pdf_rels: list[str]) -> list[dict[str, Any]]:
+    """A1: PDF info dict /Author + XMP dc:creator non-empty (§3.1)."""
+    if not pdf_rels:
+        return [_check("A1", "not_applicable",
+                       "no PDF in the blind submission set")]
+    if pypdf is None:
+        return [_check("A1", "not_checked",
+                       "parser unavailable: pypdf is not installed (pip "
+                       "install pypdf) — PDF metadata cannot be scanned")]
+    findings: "list[tuple[str, str]]" = []
+    unreadable: list[str] = []
+    for rel in pdf_rels:
+        try:
+            reader = pypdf.PdfReader(str(package_dir / rel))
+            author = _pdf_info_author(reader)
+            creators: list[str] = []
+            try:
+                xmp = reader.xmp_metadata
+                creators = [c for c in (xmp.dc_creator or []) if str(c).strip()
+                            ] if xmp else []
+            except Exception:
+                # A malformed XMP stream means HALF of A1's signal could not
+                # be read — incompleteness, not a silent pass (§1.4). The
+                # info-dict half still contributes findings if present.
+                unreadable.append(f"{rel} (XMP stream)")
+        except Exception:
+            unreadable.append(rel)
+            continue
+        if author:
+            findings.append((rel, f"/Author={author!r}"))
+        if creators:
+            findings.append((rel, f"XMP dc:creator={creators!r}"))
+    return [_residue_verdict("A1", findings, unreadable,
+                             "PDF metadata author(s)")]
+
+
+def _pdf_info_author(reader) -> str:
+    """The PDF info-dict /Author — the one definition A1 and the A6 token
+    harvest share."""
+    meta = reader.metadata
+    return str(meta.get("/Author") or "").strip() if meta else ""
+
+
+def _read_zip_part(z: "zipfile.ZipFile", name: str) -> bytes:
+    """Bounded read of one zip part (the zip-bomb guard): the declared
+    uncompressed size must stay under _MAX_XML_PART_BYTES."""
+    if z.getinfo(name).file_size > _MAX_XML_PART_BYTES:
+        raise ValueError(f"zip part {name} over the size limit")
+    return z.read(name)
+
+
+def _open_docx_guarded(path: Path) -> "zipfile.ZipFile":
+    """Open a .docx with the zip-bomb entry-count guard applied — the one
+    opening path for every DOCX reader (A2/A3 and the A6 token harvest), so
+    the guards cannot drift apart."""
+    z = zipfile.ZipFile(path)
+    if len(z.namelist()) > _MAX_ZIP_ENTRIES:
+        z.close()
+        raise ValueError("zip entry count over limit")
+    return z
+
+
+def _docx_core_author_fields(z: "zipfile.ZipFile") -> "list[tuple[str, str]]":
+    """[(label, value)] for the non-empty author fields of docProps/core.xml
+    — the one extraction A2 and the A6 token harvest share."""
+    if "docProps/core.xml" not in set(z.namelist()):
+        return []
+    root = _xml_fromstring(_read_zip_part(z, "docProps/core.xml"))
+    fields = []
+    for tag, label in ((_NS_DC + "creator", "creator"),
+                       (_NS_CP + "lastModifiedBy", "lastModifiedBy")):
+        el = root.find(tag)
+        if el is not None and (el.text or "").strip():
+            fields.append((label, el.text.strip()))
+    return fields
+
+
+# OOXML namespaces for the raw-structure DOCX scan. Read with stdlib
+# zipfile+ElementTree rather than python-docx: the parts we need
+# (docProps/core.xml, word/*.xml author attributes) are plain XML, and a
+# stdlib reader means the DOCX residue class has NO missing-parser
+# NOT-CHECKED hole at all (§1.3/§1.4; recorded as a spec §9 slice-3
+# refinement — pypdf remains the only new dependency).
+_NS_DC = "{http://purl.org/dc/elements/1.1/}"
+_NS_CP = ("{http://schemas.openxmlformats.org/package/2006/"
+          "metadata/core-properties}")
+_NS_W = ("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}")
+
+
+def _docx_residue_checks(package_dir: Path,
+                         docx_rels: list[str]) -> list[dict[str, Any]]:
+    """A2: docProps/core.xml creator/lastModifiedBy non-empty. A3: w:ins /
+    w:del / w:comment author attributes in document parts (§3.1)."""
+    if not docx_rels:
+        return [_check("A2", "not_applicable",
+                       "no DOCX in the blind submission set"),
+                _check("A3", "not_applicable",
+                       "no DOCX in the blind submission set")]
+    meta_findings: "list[tuple[str, str]]" = []
+    rev_findings: "list[tuple[str, str]]" = []
+    unreadable: list[str] = []
+    for rel in docx_rels:
+        try:
+            with _open_docx_guarded(package_dir / rel) as z:
+                for label, value in _docx_core_author_fields(z):
+                    meta_findings.append((rel, f"{label}={value!r}"))
+                for part in sorted(n for n in z.namelist()
+                                   if n.startswith("word/")
+                                   and n.endswith(".xml")):
+                    root = _xml_fromstring(_read_zip_part(z, part))
+                    for el in root.iter():
+                        if el.tag in (_NS_W + "ins", _NS_W + "del",
+                                      _NS_W + "comment"):
+                            author = (el.get(_NS_W + "author") or "").strip()
+                            if author:
+                                kind = el.tag.split("}", 1)[1]
+                                rev_findings.append(
+                                    (rel, f"w:{kind} author={author!r}"))
+        except _XML_READ_ERRORS:
+            unreadable.append(rel)
+    return [
+        _residue_verdict("A2", meta_findings, unreadable,
+                         "DOCX metadata author(s)"),
+        _residue_verdict("A3", rev_findings, unreadable,
+                         "DOCX revision/comment author(s)"),
+    ]
+
+
+def _text_residue_checks(manuscripts: dict[str, str], text_rels: list[str],
+                         profile: Optional[dict[str, Any]]
+                         ) -> list[dict[str, Any]]:
+    """A4 (acknowledgments section) + A5 (self-citation phrasing) over the
+    text-form anonymized variants."""
+    checks: list[dict[str, Any]] = []
+    a4_strict = _a4_strict(profile)
+    if not text_rels:
+        # The blind variant exists but only in a form we cannot read headings
+        # from — the scan SHOULD run and cannot: not_checked honesty (§1.4),
+        # never a not_applicable masquerade.
+        checks.append(_check(
+            "A4", "not_checked",
+            "acknowledgments scan requires a text-form (md/tex/txt) "
+            "anonymized variant; DOCX/PDF heading extraction is not supported",
+            strict_eligible=a4_strict))
+        checks.append(_check("A5", "not_checked",
+                             "no extractable text in the blind submission set"))
+        return checks
+
+    ack_hits = []
+    for rel in text_rels:
+        for title in _headings(rel, manuscripts[rel]):
+            if _ACK_TITLE_RE.search(title):
+                ack_hits.append((rel, title))
+                break
+    if ack_hits:
+        rel, title = ack_hits[0]
+        checks.append(_check(
+            "A4", "fail",
+            f"acknowledgments section present in the anonymized variant "
+            f"(heading {title!r}) — whether it de-anonymizes is the scholar's "
+            f"judgment (§3.1); flagged, never auto-removed"
+            + (" [venue declares acknowledgments forbidden in the blind "
+               "version]" if a4_strict else ""),
+            location=rel, strict_eligible=a4_strict))
+    else:
+        checks.append(_check(
+            "A4", "pass",
+            "no acknowledgments section in the anonymized variant",
+            strict_eligible=a4_strict))
+
+    phrase_hits = []
+    for rel in text_rels:
+        lowered = manuscripts[rel].lower()
+        for phrase in _SELF_CITATION_PHRASES:
+            if phrase.lower() in lowered:
+                phrase_hits.append((rel, phrase))
+    if phrase_hits:
+        rel, phrase = phrase_hits[0]
+        listed = ", ".join(sorted({p for _r, p in phrase_hits})[:_LOCATION_CAP])
+        checks.append(_check(
+            "A5", "fail",
+            f"self-citation phrasing in the anonymized variant: {listed} — "
+            f"legitimate prose can false-positive (heuristic, advisory-only)",
+            signal_class="heuristic", location=rel))
+    else:
+        checks.append(_check(
+            "A5", "pass",
+            "no self-citation phrasing detected in the anonymized variant",
+            signal_class="heuristic"))
+    return checks
+
+
+def _author_metadata_strings(package_dir: Path,
+                             rels: list[str]) -> list[str]:
+    """Author strings from PDF /Author + DOCX core.xml creator/lastModifiedBy
+    of the given artifacts — the SAME extraction (and zip guards) as A1/A2,
+    consumed best-effort (A6 is heuristic by class, so unreadable artifacts
+    are simply skipped here)."""
+    authors: list[str] = []
+    for rel in rels:
+        low = rel.lower()
+        try:
+            if low.endswith(".docx"):
+                with _open_docx_guarded(package_dir / rel) as z:
+                    authors.extend(
+                        value for _label, value in _docx_core_author_fields(z))
+            elif low.endswith(".pdf") and pypdf is not None:
+                author = _pdf_info_author(
+                    pypdf.PdfReader(str(package_dir / rel)))
+                if author:
+                    authors.append(author)
+        except Exception:
+            continue
+    return authors
+
+
+def _filename_leakage_check(package_dir: Path, all_rels: list[str],
+                            anon_rels: list[str]) -> dict[str, Any]:
+    """A6 (§3.1): author-name tokens from the NON-anonymized variant's
+    metadata appearing in package filenames. Heuristic by class (coincidental
+    name tokens false-positive). The metadata-source originals themselves are
+    not scanned — their identified filenames are expected."""
+    anon = set(anon_rels)
+    original_rels = [r for r in all_rels
+                     if r not in anon
+                     and r.lower().endswith((".docx", ".pdf"))]
+    authors = _author_metadata_strings(package_dir, original_rels)
+    if not authors:
+        return _check(
+            "A6", "not_checked",
+            "no author metadata available on the non-anonymized artifacts to "
+            "derive name tokens from")
+    # NOTE: not `\w` — underscore is a word char, and `smith_appendix` must
+    # split into tokens. Token-to-token comparison under one delimiter model:
+    # `smith` flags `smith_appendix.csv` but never `blacksmith_notes.md`.
+    def name_tokens(s: str) -> set:
+        return {t for t in re.split(r"[^a-z0-9]+", s.lower()) if t}
+
+    tokens = {t for a in authors for t in name_tokens(a) if len(t) >= 3}
+    originals = set(original_rels)
+    scanned = [r for r in all_rels if r not in originals]
+    hits = sorted(
+        r for r in scanned if tokens & name_tokens(Path(r).name))
+    if hits:
+        return _check(
+            "A6", "fail",
+            f"author-name token(s) in package filename(s): "
+            f"{', '.join(hits[:_LOCATION_CAP])} (tokens from "
+            f"{', '.join(original_rels[:_LOCATION_CAP])} metadata) — "
+            f"coincidental tokens can false-positive (heuristic)",
+            location=hits[0])
+    return _check(
+        "A6", "pass",
+        "no author-name tokens from the non-anonymized metadata appear in "
+        "package filenames")
 
 
 def run_checks(package_dir: Path,
@@ -844,7 +1291,9 @@ def run_checks(package_dir: Path,
         passport=passport, join_map=join_map)
     checks_b = run_family_b(
         manuscripts, reference_keys, reference_label, venue_profile)
-    return sorted(checks_b + checks_c, key=lambda c: c["id"]), extraction_path
+    checks_a = run_family_a(package_dir, manuscripts, venue_profile)
+    return (sorted(checks_a + checks_b + checks_c, key=lambda c: c["id"]),
+            extraction_path)
 
 
 def build_report(package_dir: Path, checks: list[dict[str, Any]],
@@ -887,7 +1336,7 @@ def render_human(report: dict[str, Any]) -> str:
         f"fingerprint: {h['package_fingerprint'][:12]}…)",
     ]
     for c in report["checks"]:
-        status = c["status"].upper().replace("NOT_CHECKED", "NOT-CHECKED")
+        status = c["status"].upper().replace("_", "-")
         loc = f" @ {c['location']}" if c["location"] else ""
         lines.append(
             f"  [{status}] {c['id']} ({c['family']}, {c['signal_class']})"

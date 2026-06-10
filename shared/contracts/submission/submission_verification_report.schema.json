@@ -72,7 +72,7 @@
         "id": {
           "type": "string",
           "pattern": "^[ABCD][1-9][0-9]*$",
-          "description": "Check id per the spec §3 family tables (A1–A6, B*, C1 orphan in-text citation, C2 uncited reference entry, D*)."
+          "description": "Check id per the spec §3 family tables (A1–A7 — A7 is the slice-3 missing-blind-version carrier, B1–B5, C1 orphan in-text citation, C2 uncited reference entry, D*)."
         },
         "family": {
           "type": "string",
@@ -94,7 +94,7 @@
         },
         "strict_eligible": {
           "type": "boolean",
-          "description": "Whether a fail on this check is promotable by terminal_policies.submission_package: strict (slice 4). Heuristic checks are NEVER strict-eligible — enforced structurally below, not by default."
+          "description": "Whether a fail on this check is promotable by terminal_policies.submission_package: strict (slice 4). Heuristic checks are NEVER strict-eligible — enforced structurally below, not by default. The bit describes blocking eligibility HAD THE CHECK RUN: the slice-4 policy evaluator keys on status (`fail` blocks; strict-eligible `not_checked` is VERIFICATION-INCOMPLETE) and `strict_eligible: true` NEVER combines with `not_applicable` to block — an untriggered check has nothing to enforce."
         },
         "status": {
           "type": "string",
@@ -102,9 +102,10 @@
             "pass",
             "fail",
             "warn",
-            "not_checked"
+            "not_checked",
+            "not_applicable"
           ],
-          "description": "pass / fail / warn (advisory finding that is never block-worthy, e.g. C2 uncited reference entry — some venues allow further-reading entries, §3.3) / not_checked (the check could not run; reason in detail; NEVER folded into pass, §1.4)."
+          "description": "pass / fail / warn (advisory finding that is never block-worthy, e.g. C2 uncited reference entry — some venues allow further-reading entries, §3.3) / not_checked (the check SHOULD have run but could not; reason in detail; NEVER folded into pass and surfaced in the header count, §1.4) / not_applicable (the check's trigger condition is not met — e.g. the Family A residue scan on a package with no anonymized variant and no declared double-blind review, §3.1; visibly distinct from not_checked so an untriggered family is not reported as incompleteness)."
         },
         "detail": {
           "type": "string",
